@@ -87,8 +87,8 @@ struct vc4_shader_validation_state {
 	/* set when we find a instruction which violates the criterion for a 
 	* threaded shader. These are:
 	* 	- only write the lower half of the register space
-	* 	- no texture read in the last block of the shader and texture 
-	*	  read present
+	* 	- last thread switch signaled at the end
+	* So track the usage of the thread switches and the register usage.
 	*/
 	bool all_registers_used;
 	bool thread_switch_present;
@@ -614,6 +614,10 @@ check_instruction_reads(struct vc4_validated_shader_info *validated_shader,
 			return false;
 		}
 	}
+	if ( (raddr_a >= 16 && raddr_a < 32)||
+		(raddr_b >= 16 && raddr_b < 32))
+		validation_state->all_registers_used = true;
+
 
 	return true;
 }
@@ -815,6 +819,7 @@ vc4_validate_shader(struct drm_gem_cma_object *shader_obj)
 		case QPU_SIG_PROG_END:
 		case QPU_SIG_SMALL_IMM:
 		case QPU_SIG_THREAD_SWITCH:
+		case QPU_SIG_LAST_THREAD_SWITCH:
 			if (!check_instruction_writes(validated_shader,
 						      &validation_state)) {
 				DRM_ERROR("Bad write at ip %d\n", ip);
@@ -889,14 +894,11 @@ vc4_validate_shader(struct drm_gem_cma_object *shader_obj)
 	if (validation_state.thread_switch_present && 
 		!validation_state.last_thread_switch_present){
 		DRM_ERROR("Shader switches threads, but does not use "
-			  "thread switch last\n");
+			  "last thread switch\n");
 		goto fail;
 	}
 	
-	/* Stricktly speaking, as nearly every time the same shader is 
-	* running on the QPU, maybe the shader wants to read from the data
-	* of the other thread, but mostly it is a programming error.
-	*/
+	/* Might corrupt other thread */
 	if (validation_state.last_thread_switch_present && 
 		validation_state.all_registers_used){
 		DRM_ERROR("Shader uses threading, but uses the upper "
@@ -904,9 +906,8 @@ vc4_validate_shader(struct drm_gem_cma_object *shader_obj)
 		goto fail;
 	}
 	
-	/* Even if no threading is used, another threaded shader might run 
-	* side by side, gaining performance.
-	*/
+	/* Even if no thread switches are used, another threaded shader might run 
+	* side by side, gaining performance. */
 	validated_shader->is_threaded = !validation_state.all_registers_used;
 
 	/* If we did a backwards branch and we haven't emitted a uniforms
