@@ -782,9 +782,14 @@ validate_gl_shader_rec(struct drm_device *dev,
 	exec->shader_rec_v += roundup(packet_size, 16);
 	exec->shader_rec_size -= packet_size;
 
+	/* The only unsave threading mode is threaded with non threaded shaders
+	*/
 	if (!(*(uint16_t *)pkt_u & VC4_SHADER_FLAG_FS_SINGLE_THREAD)) {
-		DRM_ERROR("Multi-threaded fragment shaders not supported.\n");
-		return -EINVAL;
+		if (!to_vc4_bo(&bo[0]->base)->validated_shader->is_threaded){
+			DRM_ERROR("Threaded mode with non threaded fragment "
+				  "shader specified\n");
+			return -EINVAL;
+		}
 	}
 
 	for (i = 0; i < shader_reloc_count; i++) {

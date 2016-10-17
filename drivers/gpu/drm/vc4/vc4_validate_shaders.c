@@ -83,6 +83,16 @@ struct vc4_shader_validation_state {
 	 * basic blocks.
 	 */
 	bool needs_uniform_address_for_loop;
+
+	/* set when we find a instruction which violates the criterion for a 
+	* threaded shader. These are:
+	* 	- only write the lower half of the register space
+	* 	- no texture read in the last block of the shader and texture 
+	*	  read present
+	*/
+	bool all_registers_used;
+	bool thread_switch_present;
+	bool last_thread_switch_present;
 };
 
 static uint32_t
@@ -118,6 +128,10 @@ raddr_add_a_to_live_reg_index(uint64_t inst)
 		return ~0;
 }
 
+static bool live_reg_is_upper_half(uint32_t lri){
+	return	(lri >=16 && lri < 32) ||
+		(lri >=32+16 && lri < 32+32);
+}
 static bool
 is_tmu_submit(uint32_t waddr)
 {
@@ -390,6 +404,9 @@ check_reg_write(struct vc4_validated_shader_info *validated_shader,
 		} else {
 			validation_state->live_immediates[lri] = ~0;
 		}
+
+		if (live_reg_is_upper_half(lri))
+			validation_state->all_registers_used = true;
 	}
 
 	switch (waddr) {
@@ -797,6 +814,7 @@ vc4_validate_shader(struct drm_gem_cma_object *shader_obj)
 		case QPU_SIG_LOAD_TMU1:
 		case QPU_SIG_PROG_END:
 		case QPU_SIG_SMALL_IMM:
+		case QPU_SIG_THREAD_SWITCH:
 			if (!check_instruction_writes(validated_shader,
 						      &validation_state)) {
 				DRM_ERROR("Bad write at ip %d\n", ip);
@@ -810,6 +828,19 @@ vc4_validate_shader(struct drm_gem_cma_object *shader_obj)
 			if (sig == QPU_SIG_PROG_END) {
 				found_shader_end = true;
 				shader_end_ip = ip;
+			}
+
+			if (sig == QPU_SIG_THREAD_SWITCH) {
+				validation_state.thread_switch_present = true;
+				if (validation_state.last_thread_switch_present){
+					DRM_ERROR("Thread switch after last "
+						  "thread switch present at ip %d\n", ip);
+					goto fail;
+				}
+			}
+
+			if (sig == QPU_SIG_LAST_THREAD_SWITCH){
+				validation_state.last_thread_switch_present = true;
 			}
 
 			break;
@@ -826,6 +857,14 @@ vc4_validate_shader(struct drm_gem_cma_object *shader_obj)
 			if (!check_branch(inst, validated_shader,
 					  &validation_state, ip))
 				goto fail;
+
+			if (validation_state.last_thread_switch_present){
+				DRM_ERROR("Last thread switch occured "
+					  "in front of a branch, cannot "
+					  "determine if single and last call "
+					  "to a thread switch\n");
+				goto fail;
+			}
 			break;
 		default:
 			DRM_ERROR("Unsupported QPU signal %d at "
@@ -846,6 +885,29 @@ vc4_validate_shader(struct drm_gem_cma_object *shader_obj)
 			  shader_obj->base.size);
 		goto fail;
 	}
+
+	if (validation_state.thread_switch_present && 
+		!validation_state.last_thread_switch_present){
+		DRM_ERROR("Shader switches threads, but does not use "
+			  "thread switch last\n");
+		goto fail;
+	}
+	
+	/* Stricktly speaking, as nearly every time the same shader is 
+	* running on the QPU, maybe the shader wants to read from the data
+	* of the other thread, but mostly it is a programming error.
+	*/
+	if (validation_state.last_thread_switch_present && 
+		validation_state.all_registers_used){
+		DRM_ERROR("Shader uses threading, but uses the upper "
+			  "half of the registers, too\n");
+		goto fail;
+	}
+	
+	/* Even if no threading is used, another threaded shader might run 
+	* side by side, gaining performance.
+	*/
+	validated_shader->is_threaded = !validation_state.all_registers_used;
 
 	/* If we did a backwards branch and we haven't emitted a uniforms
 	 * reset since then, we still need the uniforms stream to have the
