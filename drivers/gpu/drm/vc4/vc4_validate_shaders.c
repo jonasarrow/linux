@@ -906,9 +906,8 @@ vc4_validate_shader(struct drm_gem_cma_object *shader_obj)
 		goto fail;
 	}
 	
-	/* Even if no thread switches are used, another threaded shader might run 
-	* side by side, gaining performance. */
-	validated_shader->is_threaded = !validation_state.all_registers_used;
+	/* Enabling threading without at least one thread switch locks the qpu */
+	validated_shader->is_threaded = validation_state.last_thread_switch_present;
 
 	/* If we did a backwards branch and we haven't emitted a uniforms
 	 * reset since then, we still need the uniforms stream to have the
