@@ -615,7 +615,7 @@ check_instruction_reads(struct vc4_validated_shader_info *validated_shader,
 		}
 	}
 	if ( (raddr_a >= 16 && raddr_a < 32)||
-		(raddr_b >= 16 && raddr_b < 32))
+		(raddr_b >= 16 && raddr_b < 32 && sig != QPU_SIG_SMALL_IMM))
 		validation_state->all_registers_used = true;
 
 
@@ -837,14 +837,20 @@ vc4_validate_shader(struct drm_gem_cma_object *shader_obj)
 
 			if (sig == QPU_SIG_THREAD_SWITCH) {
 				validation_state.thread_switch_present = true;
+#if WORKAROUND_HW1632
 				if (validation_state.last_thread_switch_present){
 					DRM_ERROR("Thread switch after last "
 						  "thread switch present at ip %d\n", ip);
 					goto fail;
 				}
+#endif
 			}
 
 			if (sig == QPU_SIG_LAST_THREAD_SWITCH){
+				if (validation_state.last_thread_switch_present) {
+					DRM_ERROR("Last thread switch present twice");
+					goto fail;
+				}
 				validation_state.last_thread_switch_present = true;
 			}
 
@@ -890,16 +896,18 @@ vc4_validate_shader(struct drm_gem_cma_object *shader_obj)
 			  shader_obj->base.size);
 		goto fail;
 	}
-
+#if WORKAROUND_HW1632
 	if (validation_state.thread_switch_present && 
 		!validation_state.last_thread_switch_present){
 		DRM_ERROR("Shader switches threads, but does not use "
 			  "last thread switch\n");
 		goto fail;
 	}
+#endif
 	
 	/* Might corrupt other thread */
-	if (validation_state.last_thread_switch_present && 
+	if ((validation_state.last_thread_switch_present ||
+		validation_state.thread_switch_present) &&
 		validation_state.all_registers_used){
 		DRM_ERROR("Shader uses threading, but uses the upper "
 			  "half of the registers, too\n");
@@ -907,7 +915,14 @@ vc4_validate_shader(struct drm_gem_cma_object *shader_obj)
 	}
 	
 	/* Enabling threading without at least one thread switch locks the qpu */
+#if WORKAROUND_HW1632
 	validated_shader->is_threaded = validation_state.last_thread_switch_present;
+#else
+	validated_shader->is_threaded = 
+		!validation_state.all_registers_used && 
+		(validation_state.last_thread_switch_present || 
+			validation_state.thread_switch_present);
+#endif
 
 	/* If we did a backwards branch and we haven't emitted a uniforms
 	 * reset since then, we still need the uniforms stream to have the
