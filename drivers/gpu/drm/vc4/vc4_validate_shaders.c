@@ -39,6 +39,9 @@
 #include "vc4_drv.h"
 #include "vc4_qpu_defines.h"
 
+/* Use on a BCM2708A0 silicone for stricter validation of the shader */
+/*#define WORKAROUND_HW1632 */
+
 #define LIVE_REG_COUNT (32 + 32 + 4)
 
 struct vc4_shader_validation_state {
@@ -777,6 +780,7 @@ vc4_validate_shader(struct drm_gem_cma_object *shader_obj)
 {
 	bool found_shader_end = false;
 	int shader_end_ip = 0;
+	uint32_t last_thread_switch_ip = -3;
 	uint32_t ip;
 	struct vc4_validated_shader_info *validated_shader = NULL;
 	struct vc4_shader_validation_state validation_state;
@@ -809,6 +813,16 @@ vc4_validate_shader(struct drm_gem_cma_object *shader_obj)
 		if (!vc4_handle_branch_target(&validation_state))
 			goto fail;
 
+		if (ip == last_thread_switch_ip + 3) {
+			/* Reset r0-r3 live clamp data */
+			int i;
+			for (i = 64; i < LIVE_REG_COUNT; i++) {
+				validation_state.live_min_clamp_offsets[i] = ~0;
+				validation_state.live_max_clamp_regs[i] = false;
+				validation_state.live_immediates[i] = ~0;
+			}
+		}
+
 		switch (sig) {
 		case QPU_SIG_NONE:
 		case QPU_SIG_WAIT_FOR_SCOREBOARD:
@@ -837,7 +851,7 @@ vc4_validate_shader(struct drm_gem_cma_object *shader_obj)
 
 			if (sig == QPU_SIG_THREAD_SWITCH) {
 				validation_state.thread_switch_present = true;
-#if WORKAROUND_HW1632
+#ifdef WORKAROUND_HW1632
 				if (validation_state.last_thread_switch_present){
 					DRM_ERROR("Thread switch after last "
 						  "thread switch present at ip %d\n", ip);
@@ -848,10 +862,20 @@ vc4_validate_shader(struct drm_gem_cma_object *shader_obj)
 
 			if (sig == QPU_SIG_LAST_THREAD_SWITCH){
 				if (validation_state.last_thread_switch_present) {
-					DRM_ERROR("Last thread switch present twice");
+					DRM_ERROR("Last thread switch present twice\n");
 					goto fail;
 				}
 				validation_state.last_thread_switch_present = true;
+			}
+
+			if (sig == QPU_SIG_THREAD_SWITCH ||
+				sig == QPU_SIG_LAST_THREAD_SWITCH) {
+				if (ip < last_thread_switch_ip + 3) {
+					DRM_ERROR("Thread switch too soon after last "
+						" switch at ip %d\n", ip);
+					goto fail;
+				}
+				last_thread_switch_ip = ip;
 			}
 
 			break;
@@ -868,6 +892,12 @@ vc4_validate_shader(struct drm_gem_cma_object *shader_obj)
 			if (!check_branch(inst, validated_shader,
 					  &validation_state, ip))
 				goto fail;
+			
+			if (ip < last_thread_switch_ip + 3) {
+				DRM_ERROR("Branch in thread switch at ip %d, "
+					"instruction %llx\n", ip, inst);
+				goto fail;
+			}
 
 			if (validation_state.last_thread_switch_present){
 				DRM_ERROR("Last thread switch occured "
@@ -896,7 +926,7 @@ vc4_validate_shader(struct drm_gem_cma_object *shader_obj)
 			  shader_obj->base.size);
 		goto fail;
 	}
-#if WORKAROUND_HW1632
+#ifdef WORKAROUND_HW1632
 	if (validation_state.thread_switch_present && 
 		!validation_state.last_thread_switch_present){
 		DRM_ERROR("Shader switches threads, but does not use "
@@ -915,7 +945,7 @@ vc4_validate_shader(struct drm_gem_cma_object *shader_obj)
 	}
 	
 	/* Enabling threading without at least one thread switch locks the qpu */
-#if WORKAROUND_HW1632
+#ifdef WORKAROUND_HW1632
 	validated_shader->is_threaded = validation_state.last_thread_switch_present;
 #else
 	validated_shader->is_threaded = 
